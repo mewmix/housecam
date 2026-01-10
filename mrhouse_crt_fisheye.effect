@@ -12,9 +12,8 @@ uniform float2 uv_size;
 
 sampler_state textureSampler {
   Filter = Linear;
-  AddressU = Border;
-  AddressV = Border;
-  BorderColor = 00000000;
+  AddressU = Clamp;
+  AddressV = Clamp;
 };
 
 struct VertData {
@@ -125,6 +124,9 @@ float4 mainImage(VertData v_in) : TARGET {
   float borderPx = max(uv_pixel_interval.x, uv_pixel_interval.y);
   float borderMask = step(borderPx * 1.5, minEdge);
   col *= borderMask;
+
+  // Mask col to black outside the tube area to avoid translucent phosphor shadow
+  col *= smoothstep(1.05, 0.85, r2);
 
   return float4(col, 1.0);
 }
