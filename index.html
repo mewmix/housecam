@@ -1,0 +1,243 @@
+<!doctype html>
+<html>
+
+<head>
+  <meta charset="utf-8" />
+  <title>Mr. House CRT Cam</title>
+  <style>
+    html,
+    body {
+      margin: 0;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+    }
+
+    #gl {
+      width: 100vw;
+      height: 100vh;
+      display: block;
+    }
+
+    #hint {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      color: #9f9;
+      font: 14px/1.3 system-ui;
+      background: rgba(0, 0, 0, 0.55);
+      padding: 10px 12px;
+      border: 1px solid rgba(120, 255, 120, 0.25);
+      border-radius: 8px;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="hint">
+    Mr. House CRT cam (prototype).<br />
+    Use OBS Window Capture → Start Virtual Camera.
+  </div>
+  <canvas id="gl"></canvas>
+  <video id="vid" playsinline autoplay muted style="display:none;"></video>
+
+  <script>
+    (async () => {
+      const video = document.getElementById('vid');
+      const canvas = document.getElementById('gl');
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+        audio: false
+      });
+      video.srcObject = stream;
+      await video.play();
+
+      const gl = canvas.getContext('webgl', { premultipliedAlpha: false });
+      if (!gl) throw new Error("WebGL not available");
+
+      function resize() {
+        const dpr = Math.max(1, window.devicePixelRatio || 1);
+        canvas.width = Math.floor(canvas.clientWidth * dpr);
+        canvas.height = Math.floor(canvas.clientHeight * dpr);
+        gl.viewport(0, 0, canvas.width, canvas.height);
+      }
+      new ResizeObserver(resize).observe(canvas);
+      resize();
+
+      const vs = `
+    attribute vec2 a_pos;
+    varying vec2 v_uv;
+    void main() {
+      v_uv = (a_pos + 1.0) * 0.5;
+      gl_Position = vec4(a_pos, 0.0, 1.0);
+    }
+  `;
+
+      const fs = `
+    precision mediump float;
+    uniform sampler2D u_tex;
+    uniform vec2 u_res;
+    uniform float u_time;
+    uniform float u_flip;
+    varying vec2 v_uv;
+
+    float hash(vec2 p) {
+      p = fract(p * vec2(123.34, 345.45));
+      p += dot(p, p + 34.345);
+      return fract(p.x * p.y);
+    }
+
+    vec2 barrel(vec2 uv, float k) {
+      // uv in [0,1]
+      vec2 p = uv * 2.0 - 1.0;          // [-1,1]
+      float r2 = dot(p, p);
+      p *= 1.0 + k * r2;                // simple barrel
+      return (p * 0.5 + 0.5);
+    }
+
+    void main() {
+      // CRT curvature
+      vec2 uv = barrel(v_uv, 0.10);
+
+      // Outside curved area => black
+      if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        gl_FragColor = vec4(0.0);
+        return;
+      }
+
+      // Sample source
+      vec2 srcUV = uv;
+      if (u_flip > 0.5) srcUV = 1.0 - srcUV;
+      vec3 src = texture2D(u_tex, srcUV).rgb;
+
+      // Luma
+      float y = dot(src, vec3(0.299, 0.587, 0.114));
+
+      // Tube-like gamma / phosphor response
+      // Push mids, crush blacks a bit, keep highlights.
+      y = pow(y, 0.85);
+      y = smoothstep(0.05, 0.98, y);
+
+      // Scanlines: horizontal modulation
+      float scan = 0.88 + 0.12 * sin((uv.y * u_res.y) * 3.14159);
+      // A second finer scan component
+      scan *= 0.92 + 0.08 * sin((uv.y * u_res.y) * 6.28318);
+
+      // Subtle vertical “mask” / banding (very light)
+      float mask = 0.97 + 0.03 * sin((uv.x * u_res.x) * 2.0);
+
+      // Flicker
+      float flicker = 0.985 + 0.015 * sin(u_time * 60.0);
+
+      // Rolling refresh band (optional CRT feel)
+      float bandPos = fract(u_time * 0.12);
+      float band = 1.0 + 0.10 * exp(-pow((uv.y - bandPos) * 12.0, 2.0));
+
+      // Noise (static + grain)
+      float n = hash(uv * u_res + vec2(u_time * 60.0, u_time * 13.0));
+      float grain = (n - 0.5) * 0.07;
+
+      // Cheap bloom: re-sample a few nearby taps
+      vec2 px = 1.0 / u_res;
+      float y1 = dot(texture2D(u_tex, uv + vec2(px.x, 0.0)).rgb, vec3(0.299,0.587,0.114));
+      float y2 = dot(texture2D(u_tex, uv + vec2(-px.x,0.0)).rgb, vec3(0.299,0.587,0.114));
+      float y3 = dot(texture2D(u_tex, uv + vec2(0.0, px.y)).rgb, vec3(0.299,0.587,0.114));
+      float y4 = dot(texture2D(u_tex, uv + vec2(0.0,-px.y)).rgb, vec3(0.299,0.587,0.114));
+      float bloom = max(0.0, (max(max(y1,y2), max(y3,y4)) - 0.65)) * 0.35;
+
+      // Vignette
+      vec2 p = uv * 2.0 - 1.0;
+      float vig = 1.0 - 0.22 * dot(p, p);
+      vig = clamp(vig, 0.0, 1.0);
+
+      float intensity = (y + bloom + grain) * scan * mask * flicker * band * vig;
+      intensity = clamp(intensity, 0.0, 1.0);
+
+      // Phosphor green mapping (Mr. House-ish)
+      // Slightly yellow-green tint in highlights
+      vec3 green = vec3(0.06, 1.00, 0.18);
+      vec3 warm  = vec3(0.12, 1.00, 0.10);
+      vec3 col = mix(green, warm, smoothstep(0.65, 1.0, intensity)) * intensity;
+
+      // Black level crush (tube feel)
+      col *= smoothstep(0.02, 0.10, intensity);
+
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `;
+
+      function compile(type, src) {
+        const s = gl.createShader(type);
+        gl.shaderSource(s, src);
+        gl.compileShader(s);
+        if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+          throw new Error(gl.getShaderInfoLog(s) || "shader compile failed");
+        }
+        return s;
+      }
+
+      const prog = gl.createProgram();
+      gl.attachShader(prog, compile(gl.VERTEX_SHADER, vs));
+      gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fs));
+      gl.linkProgram(prog);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+        throw new Error(gl.getProgramInfoLog(prog) || "program link failed");
+      }
+      gl.useProgram(prog);
+
+      // Fullscreen quad
+      const buf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+        -1, -1, 1, -1, -1, 1,
+        -1, 1, 1, -1, 1, 1
+      ]), gl.STATIC_DRAW);
+
+      const a_pos = gl.getAttribLocation(prog, "a_pos");
+      gl.enableVertexAttribArray(a_pos);
+      gl.vertexAttribPointer(a_pos, 2, gl.FLOAT, false, 0, 0);
+
+      const u_tex = gl.getUniformLocation(prog, "u_tex");
+      const u_res = gl.getUniformLocation(prog, "u_res");
+      const u_time = gl.getUniformLocation(prog, "u_time");
+      const u_flip = gl.getUniformLocation(prog, "u_flip");
+
+      // Always flip 180° (works for both mobile and desktop orientations)
+      const shouldFlip = true;
+
+      // Hide hint when camera is active
+      document.getElementById('hint').style.display = 'none';
+
+      // Video texture
+      const tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.uniform1i(u_tex, 0);
+
+      const t0 = performance.now();
+      function frame() {
+        resize();
+
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+
+        // Upload current video frame
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, video);
+
+        gl.uniform2f(u_res, canvas.width, canvas.height);
+        gl.uniform1f(u_time, (performance.now() - t0) / 1000.0);
+        gl.uniform1f(u_flip, shouldFlip ? 1.0 : 0.0);
+
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+        requestAnimationFrame(frame);
+      }
+      frame();
+    })();
+  </script>
+</body>
+
+</html>
