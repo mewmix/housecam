@@ -1,4 +1,4 @@
-// Mr. House CRT shader (no fisheye, no border)
+// Mr. House CRT shader (fisheye with solid black border fill)
 // Version: 1.0.0
 
 uniform float4x4 ViewProj;
@@ -39,6 +39,21 @@ float hash(float2 p) {
   return frac(p.x * p.y);
 }
 
+float2 barrel(float2 uv, float k) {
+  float2 p = uv * 2.0 - 1.0;
+  
+  // Flip the fisheye to be portrait (on Y axis) by correcting for aspect ratio
+  // This constrains the width more than the height
+  float aspect = uv_size.x / uv_size.y;
+  p.x *= aspect;
+  
+  float r2 = dot(p, p);
+  p *= 1.0 + k * r2;
+  
+  p.x /= aspect;
+  return p * 0.5 + 0.5;
+}
+
 float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
 
 float blurLuma(float2 uv, float2 px) {
@@ -55,7 +70,11 @@ float blurLuma(float2 uv, float2 px) {
 }
 
 float4 mainImage(VertData v_in) : TARGET {
-  float2 uv = v_in.uv;
+  float2 uv = barrel(v_in.uv, 0.075);
+
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+    return float4(0.0, 0.0, 0.0, 1.0);
+  }
 
   float3 src = image.Sample(textureSampler, uv).rgb;
 
@@ -87,9 +106,17 @@ float4 mainImage(VertData v_in) : TARGET {
   float bloom = max(0.0, b - 0.55) * 0.22;
   float halo = max(0.0, b - 0.35) * 0.05;
 
+  float2 p = uv * 2.0 - 1.0;
+  float aspect = uv_size.x / uv_size.y;
+  p.x *= aspect;
+  float r2 = dot(p, p);
+  float vig = 1.0 - 0.30 * r2;
+  vig *= smoothstep(1.05, 0.55, r2);
+  vig = clamp(vig, 0.0, 1.0);
+
   float intensity = max(t, 0.04);
   intensity += bloom;
-  intensity = (intensity + grain) * scan * mask * flicker * band;
+  intensity = (intensity + grain) * scan * mask * flicker * band * vig;
   intensity = saturate(intensity);
 
   float3 phosphorShadow = float3(0.21, 0.31, 0.26);
@@ -101,7 +128,15 @@ float4 mainImage(VertData v_in) : TARGET {
   float3 col = lerp(phosphorShadow, phosphorBase, smoothstep(0.05, 0.55, i));
   col = lerp(col, phosphorHi, smoothstep(0.60, 1.00, i));
   col += phosphorGlow * bloom * 1.4;
-  col = lerp(float3(0.03, 0.05, 0.04), col, 0.96);
+  // Hard mask to keep the fisheye border fully black (no translucent rim).
+  float2 edge = min(uv, 1.0 - uv);
+  float minEdge = min(edge.x, edge.y);
+  float borderPx = max(uv_pixel_interval.x, uv_pixel_interval.y);
+  float borderMask = step(borderPx * 1.5, minEdge);
+  col *= borderMask;
+
+  // Mask col to black outside the tube area to avoid translucent phosphor shadow
+  col *= smoothstep(1.05, 0.85, r2);
 
   return float4(col, 1.0);
 }
