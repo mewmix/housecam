@@ -119,8 +119,12 @@ float4 mainImage(VertData v_in) : TARGET {
   float3 col = lerp(phosphorShadow, phosphorBase, smoothstep(0.05, 0.55, i));
   col = lerp(col, phosphorHi, smoothstep(0.60, 1.00, i));
   col += phosphorGlow * bloom * 1.4;
-  // Keep blacks fully opaque/solid for border look.
-  col = col;
+  // Hard mask to keep the fisheye border fully black (no translucent rim).
+  float2 edge = min(uv, 1.0 - uv);
+  float minEdge = min(edge.x, edge.y);
+  float borderPx = max(uv_pixel_interval.x, uv_pixel_interval.y);
+  float borderMask = step(borderPx * 1.5, minEdge);
+  col *= borderMask;
 
   return float4(col, 1.0);
 }
