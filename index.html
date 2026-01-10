@@ -75,97 +75,127 @@
   `;
 
       const fs = `
-    precision mediump float;
-    uniform sampler2D u_tex;
-    uniform vec2 u_res;
-    uniform float u_time;
-    uniform float u_flip;
-    varying vec2 v_uv;
+precision mediump float;
 
-    float hash(vec2 p) {
-      p = fract(p * vec2(123.34, 345.45));
-      p += dot(p, p + 34.345);
-      return fract(p.x * p.y);
-    }
+uniform sampler2D u_tex;
+uniform vec2 u_res;
+uniform float u_time;
+uniform float u_flip;
+varying vec2 v_uv;
 
-    vec2 barrel(vec2 uv, float k) {
-      // uv in [0,1]
-      vec2 p = uv * 2.0 - 1.0;          // [-1,1]
-      float r2 = dot(p, p);
-      p *= 1.0 + k * r2;                // simple barrel
-      return (p * 0.5 + 0.5);
-    }
+float hash(vec2 p) {
+  p = fract(p * vec2(123.34, 345.45));
+  p += dot(p, p + 34.345);
+  return fract(p.x * p.y);
+}
 
-    void main() {
-      // CRT curvature
-      vec2 uv = barrel(v_uv, 0.10);
+vec2 barrel(vec2 uv, float k) {
+  vec2 p = uv * 2.0 - 1.0;
+  float r2 = dot(p, p);
+  p *= 1.0 + k * r2;
+  return p * 0.5 + 0.5;
+}
 
-      // Outside curved area => black
-      if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-        gl_FragColor = vec4(0.0);
-        return;
-      }
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
 
-      // Sample source
-      vec2 srcUV = uv;
-      if (u_flip > 0.5) srcUV = 1.0 - srcUV;
-      vec3 src = texture2D(u_tex, srcUV).rgb;
+// Simple multi-tap blur for halation (cheap bloom)
+float blurLuma(vec2 uv, vec2 px) {
+  float s = 0.0;
+  s += luma(texture2D(u_tex, uv + px*vec2( 1.0, 0.0)).rgb);
+  s += luma(texture2D(u_tex, uv + px*vec2(-1.0, 0.0)).rgb);
+  s += luma(texture2D(u_tex, uv + px*vec2( 0.0, 1.0)).rgb);
+  s += luma(texture2D(u_tex, uv + px*vec2( 0.0,-1.0)).rgb);
+  s += luma(texture2D(u_tex, uv + px*vec2( 1.0, 1.0)).rgb);
+  s += luma(texture2D(u_tex, uv + px*vec2(-1.0, 1.0)).rgb);
+  s += luma(texture2D(u_tex, uv + px*vec2( 1.0,-1.0)).rgb);
+  s += luma(texture2D(u_tex, uv + px*vec2(-1.0,-1.0)).rgb);
+  return s / 8.0;
+}
 
-      // Luma
-      float y = dot(src, vec3(0.299, 0.587, 0.114));
+void main() {
+  // Curvature (slightly less than your current 0.10 tends to look more "TV prop")
+  vec2 uv = barrel(v_uv, 0.075);
 
-      // Tube-like gamma / phosphor response
-      // Push mids, crush blacks a bit, keep highlights.
-      y = pow(y, 0.85);
-      y = smoothstep(0.05, 0.98, y);
+  // Outside screen => black
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+    gl_FragColor = vec4(0.0);
+    return;
+  }
 
-      // Scanlines: horizontal modulation
-      float scan = 0.88 + 0.12 * sin((uv.y * u_res.y) * 3.14159);
-      // A second finer scan component
-      scan *= 0.92 + 0.08 * sin((uv.y * u_res.y) * 6.28318);
+  vec2 srcUV = uv;
+  if (u_flip > 0.5) srcUV = 1.0 - srcUV;
 
-      // Subtle vertical “mask” / banding (very light)
-      float mask = 0.97 + 0.03 * sin((uv.x * u_res.x) * 2.0);
+  vec3 src = texture2D(u_tex, srcUV).rgb;
 
-      // Flicker
-      float flicker = 0.985 + 0.015 * sin(u_time * 60.0);
+  // Slight pre-desat so the phosphor mapping doesn't inherit camera colors too strongly
+  float y = luma(src);
+  // keep a tiny bit of source structure (helps faces look less flat)
+  float yDetail = luma(mix(vec3(y), src, 0.12));
 
-      // Rolling refresh band (optional CRT feel)
-      float bandPos = fract(u_time * 0.12);
-      float band = 1.0 + 0.10 * exp(-pow((uv.y - bandPos) * 12.0, 2.0));
+  // Tube-ish tone curve: lift blacks a touch, compress highlights
+  float t = yDetail;
+  t = pow(t, 0.95);                 // mild gamma
+  t = smoothstep(0.03, 0.92, t);    // softer contrast than your crush
+  // gentle shoulder (keeps highlights "milky")
+  t = t / (t + 0.35);
 
-      // Noise (static + grain)
-      float n = hash(uv * u_res + vec2(u_time * 60.0, u_time * 13.0));
-      float grain = (n - 0.5) * 0.07;
+  // Scanlines (softer + less “stripy” than your current)
+  float sl1 = 0.94 + 0.06 * sin((uv.y * u_res.y) * 3.14159);
+  float sl2 = 0.97 + 0.03 * sin((uv.y * u_res.y) * 6.28318);
+  float scan = sl1 * sl2;
 
-      // Cheap bloom: re-sample a few nearby taps
-      vec2 px = 1.0 / u_res;
-      float y1 = dot(texture2D(u_tex, uv + vec2(px.x, 0.0)).rgb, vec3(0.299,0.587,0.114));
-      float y2 = dot(texture2D(u_tex, uv + vec2(-px.x,0.0)).rgb, vec3(0.299,0.587,0.114));
-      float y3 = dot(texture2D(u_tex, uv + vec2(0.0, px.y)).rgb, vec3(0.299,0.587,0.114));
-      float y4 = dot(texture2D(u_tex, uv + vec2(0.0,-px.y)).rgb, vec3(0.299,0.587,0.114));
-      float bloom = max(0.0, (max(max(y1,y2), max(y3,y4)) - 0.75)) * 0.15;
+  // Very subtle vertical mask / banding
+  float mask = 0.985 + 0.015 * sin((uv.x * u_res.x) * 2.0);
 
-      // Vignette
-      vec2 p = uv * 2.0 - 1.0;
-      float vig = 1.0 - 0.22 * dot(p, p);
-      vig = clamp(vig, 0.0, 1.0);
+  // Subtle flicker
+  float flicker = 0.992 + 0.008 * sin(u_time * 55.0);
 
-      float intensity = (y + bloom + grain) * scan * mask * flicker * band * vig;
-      intensity = clamp(intensity, 0.0, 1.0);
+  // Rolling refresh band (keep it subtle; TV show look is present but not arcade-strong)
+  float bandPos = fract(u_time * 0.10);
+  float band = 1.0 + 0.06 * exp(-pow((uv.y - bandPos) * 10.0, 2.0));
 
-      // Phosphor green mapping (Mr. House-ish)
-      // Slightly yellow-green tint in highlights
-      vec3 green = vec3(0.06, 1.00, 0.18);
-      vec3 warm  = vec3(0.12, 1.00, 0.10);
-      vec3 col = mix(green, warm, smoothstep(0.65, 1.0, intensity)) * intensity;
+  // Noise: fine grain, not “snow”
+  float n = hash(uv * u_res + vec2(u_time * 60.0, u_time * 11.0));
+  float grain = (n - 0.5) * 0.04;
 
-      // Black level crush (tube feel)
-      col *= smoothstep(0.02, 0.10, intensity);
+  // Halation / bloom: stronger and wider than your current
+  vec2 px = 1.0 / u_res;
+  float b = blurLuma(srcUV, px * 1.6);
+  float bloom = max(0.0, b - 0.55) * 0.22;   // threshold + gain
+  float halo  = max(0.0, b - 0.35) * 0.05;   // low-threshold “glass haze”
 
-      gl_FragColor = vec4(col, 1.0);
-    }
-  `;
+  // Vignette + edge darkening (film/photo of CRT)
+  vec2 p = uv * 2.0 - 1.0;
+  float r2 = dot(p, p);
+  float vig = 1.0 - 0.30 * r2;
+  vig *= smoothstep(1.05, 0.55, r2); // stronger corners
+  vig = clamp(vig, 0.0, 1.0);
+
+  // Final intensity
+  float intensity = t;
+  intensity += bloom;
+  intensity = (intensity + grain) * scan * mask * flicker * band * vig;
+  intensity = clamp(intensity, 0.0, 1.0);
+
+  // Fallout-TV phosphor palette: muted green/gray with warmer highlights
+  // (This is the main fix vs your neon vec3(0.06,1.00,0.18) mapping.)
+  vec3 phosphorBase = vec3(0.54, 0.86, 0.66); // milky green w/ gray
+  vec3 phosphorWarm = vec3(0.80, 0.96, 0.62); // warmer/yellow-ish in brights
+
+  // Tint blend: more warm only near top end
+  float warmMix = smoothstep(0.55, 1.00, intensity);
+  vec3 phosphor = mix(phosphorBase, phosphorWarm, warmMix);
+
+  // Keep blacks from going “ink black” (TV prop look)
+  float blackLift = 0.06;
+  vec3 col = phosphor * intensity;
+  col = col + phosphor * halo;                 // glass haze
+  col = mix(vec3(0.0), col, 1.0 - blackLift) + phosphor * blackLift * intensity;
+
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
 
       function compile(type, src) {
         const s = gl.createShader(type);
