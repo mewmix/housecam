@@ -60,41 +60,32 @@ function apply_effect(props, p)
 		return
 	end
 
-	-- 1. Noise Gate (Intercom Squelch)
-	-- Cuts silence abruptly to sound like PTT (Push-To-Talk)
-	create_filter(source, "MrHouse_Gate", "noise_gate_filter", {
-		open_threshold = -26.0,
-		close_threshold = -32.0,
-		attack_time = 10,
-		hold_time = 50,
-		release_time = 50
+	-- 1. Create EQ (Telephone Effect)
+	-- OBS Native 3-Band EQ
+	create_filter(source, "MrHouse_EQ", "obs_3band_eq_filter", {
+		high = -20.0, -- Cut treble
+		mid = 2.0,    -- Boost mids slightly
+		low = -20.0   -- Cut bass
 	})
 
-	-- 2. Stacked EQ (Steeper Telephone Effect)
-	-- Native EQ is gentle, so we stack TWO of them to cut frequencies harder (-40dB total)
-	create_filter(source, "MrHouse_EQ_1", "obs_3band_eq_filter", {
-		high = -20.0, mid = 3.0, low = -20.0
-	})
-	create_filter(source, "MrHouse_EQ_2", "obs_3band_eq_filter", {
-		high = -20.0, mid = 2.0, low = -20.0
-	})
-
-	-- 3. Distortion (Harder Drive)
+	-- 2. Create Distortion (Gain + Hard Clip)
+	-- Step A: Boost Gain into the ceiling
 	create_filter(source, "MrHouse_Drive", "gain_filter", {
-		db = 25.0 -- Pushed harder for more crunch
+		db = 20.0
 	})
+	-- Step B: Hard Limit to square it off (Distortion)
 	create_filter(source, "MrHouse_Clip", "limiter_filter", {
-		threshold = -25.0,
-		release = 50
+		threshold = -20.0,
+		release = 60
 	})
 
-	-- 4. Compressor (Broadcast consistency)
+	-- 3. Create Compressor (Consistency)
 	create_filter(source, "MrHouse_Comp", "compressor_filter", {
-		ratio = 15.0, -- Higher ratio
-		threshold = -30.0,
+		ratio = 10.0,
+		threshold = -25.0,
 		attack_time = 2,
 		release_time = 100,
-		output_gain = 2.0
+		output_gain = 0.0
 	})
 
 	obs.obs_source_release(source)
