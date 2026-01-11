@@ -29,11 +29,15 @@ function script_properties()
 	if sources ~= nil then
 		for _, source in ipairs(sources) do
 			local source_id = obs.obs_source_get_id(source)
-			-- Only list audio capable sources
-			local flags = obs.obs_source_get_output_flags(source)
-			if bit.band(flags, obs.OBS_SOURCE_AUDIO) ~= 0 then
-				local name = obs.obs_source_get_name(source)
-				obs.obs_property_list_add_string(p, name, name)
+			-- Only list audio capable sources that are INPUTS (e.g. Mics, Media Files)
+			-- This excludes Scenes, Groups, and Transitions
+			local type = obs.obs_source_get_type(source)
+			if type == obs.OBS_SOURCE_TYPE_INPUT then
+				local flags = obs.obs_source_get_output_flags(source)
+				if bit.band(flags, obs.OBS_SOURCE_AUDIO) ~= 0 then
+					local name = obs.obs_source_get_name(source)
+					obs.obs_property_list_add_string(p, name, name)
+				end
 			end
 		end
 	end
