@@ -103,15 +103,15 @@ float4 mainImage(VertData v_in) : TARGET {
   float burstPeriod = 120.0;
   float flickerDur = 0.06;
   float rollDur = 0.14;
-  float cycle = frac(elapsed_time / burstPeriod);
+  float tCycle = fmod(elapsed_time, burstPeriod);
   float vOffset = 0.0;
 
   float2 sourceUV = screenUV;
-  if (cycle < flickerDur) {
+  if (tCycle < flickerDur) {
     vOffset = 0.0;
-  } else if (cycle < (flickerDur + rollDur)) {
-    float rollSpeed = 2.5;
-    vOffset = frac(elapsed_time * rollSpeed);
+  } else if (tCycle < (flickerDur + rollDur)) {
+    float rollPhase = (tCycle - flickerDur) / rollDur;
+    vOffset = rollPhase;
   }
   sourceUV.y = frac(sourceUV.y + vOffset);
 
@@ -133,9 +133,9 @@ float4 mainImage(VertData v_in) : TARGET {
 
   float flickerBase = 0.992 + 0.008 * sin(elapsed_time * 55.0);
   float flickerBoost = 1.0;
-  if (cycle < flickerDur) {
+  if (tCycle < flickerDur) {
     flickerBoost = 0.9 + 0.1 * sin(elapsed_time * 180.0 * 6.28);
-  } else if (cycle < (flickerDur + rollDur)) {
+  } else if (tCycle < (flickerDur + rollDur)) {
     flickerBoost = 0.95 + 0.05 * sin(elapsed_time * 120.0 * 6.28);
   }
   float flicker = flickerBase * flickerBoost;
