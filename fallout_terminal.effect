@@ -84,9 +84,9 @@ float4 mainImage(VertData v_in) : TARGET {
 
   // 2. Vertical Hold Failure (The "Glitch")
   // Brief burst: flicker, then a quick roll, then back to normal.
-  float burstPeriod = 8.0;
-  float flickerDur = 0.18;
-  float rollDur = 0.35;
+  float burstPeriod = 120.0;
+  float flickerDur = 0.06;
+  float rollDur = 0.14;
   float cycle = frac(elapsed_time / burstPeriod);
   float vOffset = 0.0;
   
