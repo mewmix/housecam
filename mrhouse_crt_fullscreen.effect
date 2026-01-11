@@ -1,0 +1,146 @@
+// Mr. House CRT shader (Fullscreen / No Border)
+// Version: 1.0.0
+// Removed portrait masking to fill the screen.
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform float elapsed_time;
+uniform float2 uv_offset;
+uniform float2 uv_scale;
+uniform float2 uv_pixel_interval;
+uniform float2 uv_size;
+
+sampler_state textureSampler {
+  Filter = Linear;
+  AddressU = Clamp; // Clamp to edge to prevent repeating
+  AddressV = Clamp;
+};
+
+struct VertData {
+  float4 pos : POSITION;
+  float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in) {
+  VertData v_out;
+  v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+  v_out.uv = v_in.uv * uv_scale + uv_offset;
+  return v_out;
+}
+
+float smoothstep(float a, float b, float x) {
+  float t = saturate((x - a) / (b - a));
+  return t * t * (3.0 - 2.0 * t);
+}
+
+float hash(float2 p) {
+  p = frac(p * float2(123.34, 345.45));
+  p += dot(p, p + 34.345);
+  return frac(p.x * p.y);
+}
+
+float2 barrel(float2 uv, float k) {
+  float2 p = uv * 2.0 - 1.0;
+  
+  // Standard aspect correction for circular distortion
+  float aspect = uv_size.x / uv_size.y;
+  p.x *= aspect;
+  
+  float r2 = dot(p, p);
+  p *= 1.0 + k * r2;
+  
+  p.x /= aspect;
+  return p * 0.5 + 0.5;
+}
+
+float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
+
+float blurLuma(float2 uv, float2 px) {
+  float s = 0.0;
+  s += luma(image.Sample(textureSampler, uv + px * float2( 1.0, 0.0)).rgb);
+  s += luma(image.Sample(textureSampler, uv + px * float2(-1.0, 0.0)).rgb);
+  s += luma(image.Sample(textureSampler, uv + px * float2( 0.0, 1.0)).rgb);
+  s += luma(image.Sample(textureSampler, uv + px * float2( 0.0,-1.0)).rgb);
+  s += luma(image.Sample(textureSampler, uv + px * float2( 1.0, 1.0)).rgb);
+  s += luma(image.Sample(textureSampler, uv + px * float2(-1.0, 1.0)).rgb);
+  s += luma(image.Sample(textureSampler, uv + px * float2( 1.0,-1.0)).rgb);
+  s += luma(image.Sample(textureSampler, uv + px * float2(-1.0,-1.0)).rgb);
+  return s / 8.0;
+}
+
+float4 mainImage(VertData v_in) : TARGET {
+  // Reduced curvature for fullscreen usage
+  float2 uv = barrel(v_in.uv, 0.04);
+
+  // Removed hard black clamp. 
+  // Sampler is set to Clamp, so out-of-bounds UVs will streak the edge pixels.
+  // We'll rely on the vignette to hide the edges nicely.
+
+  float3 src = image.Sample(textureSampler, uv).rgb;
+
+  float y = luma(src);
+  src = lerp(float3(y, y, y), src, 0.08);
+  float yDetail = luma(src);
+
+  float t = yDetail;
+  t = pow(t, 0.95);
+  t = smoothstep(0.03, 0.92, t);
+  t = t / (t + 0.35);
+
+  float sl1 = 0.94 + 0.06 * sin((uv.y * uv_size.y) * 3.14159);
+  float sl2 = 0.97 + 0.03 * sin((uv.y * uv_size.y) * 6.28318);
+  float scan = sl1 * sl2;
+
+  float mask = 0.985 + 0.015 * sin((uv.x * uv_size.x) * 2.0);
+
+  float flicker = 0.992 + 0.008 * sin(elapsed_time * 55.0);
+
+  float bandPos = frac(elapsed_time * 0.10);
+  float band = 1.0 + 0.06 * exp(-pow((uv.y - bandPos) * 10.0, 2.0));
+
+  float n = hash(uv * uv_size + float2(elapsed_time * 60.0, elapsed_time * 11.0));
+  float grain = (n - 0.5) * 0.04;
+
+  float2 px = uv_pixel_interval;
+  float b = blurLuma(uv, px * 1.6);
+  float bloom = max(0.0, b - 0.55) * 0.22;
+  float halo = max(0.0, b - 0.35) * 0.05;
+
+  float2 p = uv * 2.0 - 1.0;
+  float aspect = uv_size.x / uv_size.y;
+  p.x *= aspect;
+  float r2 = dot(p, p);
+  
+  // Adjusted Vignette: softer and wider since we don't have the hard mask
+  float vig = 1.0 - 0.20 * r2; 
+  vig *= smoothstep(1.8, 0.4, r2); // Pushed out further
+  vig = clamp(vig, 0.0, 1.0);
+
+  float intensity = max(t, 0.04);
+  intensity += bloom;
+  intensity = (intensity + grain) * scan * mask * flicker * band * vig;
+  intensity = saturate(intensity);
+
+  float3 phosphorShadow = float3(0.21, 0.31, 0.26);
+  float3 phosphorBase   = float3(0.48, 0.71, 0.58);
+  float3 phosphorGlow   = float3(0.41, 0.66, 0.54);
+  float3 phosphorHi     = float3(0.66, 0.84, 0.73);
+
+  float i = intensity;
+  float3 col = lerp(phosphorShadow, phosphorBase, smoothstep(0.05, 0.55, i));
+  col = lerp(col, phosphorHi, smoothstep(0.60, 1.00, i));
+  col += phosphorGlow * bloom * 1.4;
+
+  // REMOVED: Hard mask border logic
+  // REMOVED: Tube mask logic
+
+  return float4(col, 1.0);
+}
+
+technique Draw {
+  pass {
+    vertex_shader = VSDefault(v_in);
+    pixel_shader = mainImage(v_in);
+  }
+}

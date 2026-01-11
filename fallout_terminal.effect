@@ -1,0 +1,183 @@
+// Fallout Terminal CRT Shader (P1 Green Phosphor)
+// Simulates a 1970s/80s monochrome terminal with vertical hold failure.
+// Based on Fallout aesthetics: Green P1 phosphor, mild bloom, raster scanlines, and vertical roll.
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform float elapsed_time;
+uniform float2 uv_offset;
+uniform float2 uv_scale;
+uniform float2 uv_pixel_interval;
+uniform float2 uv_size;
+
+sampler_state textureSampler {
+  Filter = Linear;
+  AddressU = Wrap; // Important for vertical roll
+  AddressV = Wrap; // Important for vertical roll
+};
+
+struct VertData {
+  float4 pos : POSITION;
+  float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in) {
+  VertData v_out;
+  v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+  v_out.uv = v_in.uv * uv_scale + uv_offset;
+  return v_out;
+}
+
+float smoothstep(float a, float b, float x) {
+  float t = saturate((x - a) / (b - a));
+  return t * t * (3.0 - 2.0 * t);
+}
+
+float hash(float2 p) {
+  p = frac(p * float2(123.34, 345.45));
+  p += dot(p, p + 34.345);
+  return frac(p.x * p.y);
+}
+
+float2 barrel(float2 uv, float k) {
+  float2 p = uv * 2.0 - 1.0;
+  
+  // Correct aspect ratio for portrait/landscape to keep curvature uniform-ish
+  float aspect = uv_size.x / uv_size.y;
+  p.x *= aspect;
+  
+  float r2 = dot(p, p);
+  p *= 1.0 + k * r2;
+  
+  p.x /= aspect;
+  return p * 0.5 + 0.5;
+}
+
+float luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
+
+// Simple box/cross blur for bloom/halation
+float blurLuma(float2 uv, float2 px) {
+  float s = 0.0;
+  // Sample a slightly wider area for that "glowy" terminal look
+  float2 off = px * 2.0; 
+  s += luma(image.Sample(textureSampler, uv + off * float2( 1.0, 0.0)).rgb);
+  s += luma(image.Sample(textureSampler, uv + off * float2(-1.0, 0.0)).rgb);
+  s += luma(image.Sample(textureSampler, uv + off * float2( 0.0, 1.0)).rgb);
+  s += luma(image.Sample(textureSampler, uv + off * float2( 0.0,-1.0)).rgb);
+  // Diagonals
+  s += luma(image.Sample(textureSampler, uv + off * float2( 1.0, 1.0)).rgb);
+  s += luma(image.Sample(textureSampler, uv + off * float2(-1.0, 1.0)).rgb);
+  s += luma(image.Sample(textureSampler, uv + off * float2( 1.0,-1.0)).rgb);
+  s += luma(image.Sample(textureSampler, uv + off * float2(-1.0,-1.0)).rgb);
+  return s / 8.0;
+}
+
+float4 mainImage(VertData v_in) : TARGET {
+  // 1. Distortion (Physical Screen Curvature)
+  float2 screenUV = barrel(v_in.uv, 0.06); // Slightly flatter than the fisheye, more "terminal"
+
+  // Hard black border outside the tube
+  if (screenUV.x < 0.0 || screenUV.x > 1.0 || screenUV.y < 0.0 || screenUV.y > 1.0) {
+    return float4(0.0, 0.0, 0.0, 1.0);
+  }
+
+  // 2. Vertical Hold Failure (The "Glitch")
+  // Brief burst: flicker, then a quick roll, then back to normal.
+  float burstPeriod = 8.0;
+  float flickerDur = 0.18;
+  float rollDur = 0.35;
+  float cycle = frac(elapsed_time / burstPeriod);
+  float vOffset = 0.0;
+  
+  // Apply roll to the sampling UVs. 
+  // We subtract because sampling "higher" V moves the image "down", so adding V moves image "up"? 
+  // UV (0,0) top-left. Increasing V goes down. 
+  // To move image UP, we need to see pixels that are "lower" in the source image at the top of the screen.
+  // So at screenUV.y=0, we want to see sourceUV.y = 0 + offset.
+  float2 sourceUV = screenUV;
+  if (cycle < flickerDur) {
+    vOffset = 0.0;
+  } else if (cycle < (flickerDur + rollDur)) {
+    float rollSpeed = 2.5;
+    vOffset = frac(elapsed_time * rollSpeed);
+  }
+  sourceUV.y = frac(sourceUV.y + vOffset); 
+
+  // 3. Source Sampling & Processing
+  float3 src = image.Sample(textureSampler, sourceUV).rgb;
+
+  // Monochrome conversion (Green P1 Focus)
+  float y = luma(src);
+  
+  // Contrast curve - Terminal text needs to be sharp but glowy
+  // Crush blacks slightly, boost mids
+  float t = max(0.0, y - 0.05); 
+  t = pow(t, 0.9); // Gamma correction
+  t = t * 1.2;     // Boost brightness
+
+  // 4. CRT Artifacts
+  
+  // Scanlines - Raster style (horizontal lines)
+  // High frequency, subtle
+  float scanCount = uv_size.y * 0.5; // Half resolution scanlines for retro feel
+  float scan = 0.85 + 0.15 * sin(screenUV.y * 3.14159 * scanCount * 2.0);
+
+  // Vertical Mask (Phosphor grid hints) - very subtle
+  float mask = 0.95 + 0.05 * sin(screenUV.x * uv_size.x * 1.5);
+
+  // Flicker (50/60Hz hum) with a brief burst before the roll
+  float flickerBase = 0.98 + 0.02 * sin(elapsed_time * 60.0 * 6.28);
+  float flickerBoost = 1.0;
+  if (cycle < flickerDur) {
+    flickerBoost = 0.9 + 0.1 * sin(elapsed_time * 180.0 * 6.28);
+  } else if (cycle < (flickerDur + rollDur)) {
+    flickerBoost = 0.95 + 0.05 * sin(elapsed_time * 120.0 * 6.28);
+  }
+  float flicker = flickerBase * flickerBoost;
+
+  // Noise (Grain)
+  float n = hash(screenUV * uv_size + float2(elapsed_time * 10.0, elapsed_time * 55.0));
+  float grain = (n - 0.5) * 0.08;
+
+  // Bloom / Halation
+  float b = blurLuma(sourceUV, uv_pixel_interval);
+  float bloom = max(0.0, b - 0.4) * 0.5; // Stronger bloom for that radioactive glow
+
+  // Vignette (Dark corners)
+  float2 p = screenUV * 2.0 - 1.0;
+  float aspect = uv_size.x / uv_size.y;
+  p.x *= aspect;
+  float r2 = dot(p, p);
+  float vig = smoothstep(1.3, 0.6, r2); // Soft vignette
+
+  // 5. Composition
+  
+  float intensity = t + bloom;
+  intensity = (intensity + grain) * scan * mask * flicker * vig;
+  intensity = saturate(intensity);
+
+  // 6. Color Mapping (P1 Green Phosphor)
+  // Strictly monochromatic green palette
+  float3 pBlack = float3(0.0, 0.02, 0.0);       // Black (off)
+  float3 pDim   = float3(0.0, 0.25, 0.1);       // Dim glow
+  float3 pMid   = float3(0.0, 0.75, 0.25);      // Active text
+  float3 pBright= float3(0.6, 1.0, 0.6);        // Bloom/Overdrive
+
+  float3 col = lerp(pBlack, pDim, smoothstep(0.0, 0.3, intensity));
+  col = lerp(col, pMid, smoothstep(0.3, 0.7, intensity));
+  col = lerp(col, pBright, smoothstep(0.7, 1.0, intensity));
+
+  // Add the bloom color on top for extra glow
+  col += pMid * bloom * 0.5;
+
+  // Final clamp
+  return float4(saturate(col), 1.0);
+}
+
+technique Draw {
+  pass {
+    vertex_shader = VSDefault(v_in);
+    pixel_shader = mainImage(v_in);
+  }
+}

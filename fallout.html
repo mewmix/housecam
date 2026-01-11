@@ -1,0 +1,284 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Fallout Terminal Cam</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #050; /* Dark green background for that extra retro feel */
+      overflow: hidden;
+      font-family: monospace;
+    }
+    #gl {
+      width: 100vw;
+      height: 100vh;
+      display: block;
+    }
+    #ui {
+      position: fixed;
+      top: 20px;
+      left: 20px;
+      color: #4f4; /* Terminal green */
+      background: rgba(0, 20, 0, 0.85);
+      border: 2px solid #4f4;
+      padding: 15px;
+      border-radius: 4px;
+      box-shadow: 0 0 10px #4f4;
+      pointer-events: none; /* Let clicks pass through */
+    }
+    h1 { margin: 0 0 10px 0; font-size: 18px; text-transform: uppercase; }
+    p { margin: 0; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <h1>RobCo Industries</h1>
+    <p>Unified Operating System v7.1</p>
+    <p>> CAMERA_FEED: ONLINE</p>
+    <p>> V_HOLD: UNSTABLE</p>
+  </div>
+  <canvas id="gl"></canvas>
+  <video id="vid" playsinline autoplay muted style="display:none;"></video>
+
+  <script>
+    (async () => {
+      const video = document.getElementById('vid');
+      const canvas = document.getElementById('gl');
+
+      // Request camera
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+          audio: false
+        });
+        video.srcObject = stream;
+        await video.play();
+      } catch (e) {
+        console.error("Camera access denied or failed:", e);
+        document.getElementById('ui').innerHTML += "<p style='color:red'>> ERROR: NO INPUT</p>";
+      }
+
+      const gl = canvas.getContext('webgl', { premultipliedAlpha: false });
+      if (!gl) {
+        document.body.innerHTML = "WebGL not supported.";
+        return;
+      }
+
+      function resize() {
+        const dpr = Math.max(1, window.devicePixelRatio || 1);
+        canvas.width = Math.floor(canvas.clientWidth * dpr);
+        canvas.height = Math.floor(canvas.clientHeight * dpr);
+        gl.viewport(0, 0, canvas.width, canvas.height);
+      }
+      new ResizeObserver(resize).observe(canvas);
+      resize();
+
+      const vs = `
+        attribute vec2 a_pos;
+        varying vec2 v_uv;
+        void main() {
+          v_uv = (a_pos + 1.0) * 0.5;
+          // Flip Y for WebGL texture coords vs screen coords if needed, 
+          // but usually video textures are right-side up.
+          // We'll handle flipping in FS if needed.
+          gl_Position = vec4(a_pos, 0.0, 1.0);
+        }
+      `;
+
+      const fs = `
+        precision mediump float;
+
+        uniform sampler2D u_tex;
+        uniform vec2 u_res;
+        uniform float u_time;
+        
+        varying vec2 v_uv;
+
+        float hash(vec2 p) {
+          p = fract(p * vec2(123.34, 345.45));
+          p += dot(p, p + 34.345);
+          return fract(p.x * p.y);
+        }
+
+        // Barrel distortion
+        vec2 barrel(vec2 uv, float k) {
+          vec2 p = uv * 2.0 - 1.0;
+          float aspect = u_res.x / u_res.y;
+          p.x *= aspect;
+          float r2 = dot(p, p);
+          p *= 1.0 + k * r2;
+          p.x /= aspect;
+          return p * 0.5 + 0.5;
+        }
+
+        float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+        float blurLuma(vec2 uv, vec2 px) {
+          float s = 0.0;
+          vec2 off = px * 2.0; 
+          s += luma(texture2D(u_tex, uv + off * vec2( 1.0, 0.0)).rgb);
+          s += luma(texture2D(u_tex, uv + off * vec2(-1.0, 0.0)).rgb);
+          s += luma(texture2D(u_tex, uv + off * vec2( 0.0, 1.0)).rgb);
+          s += luma(texture2D(u_tex, uv + off * vec2( 0.0,-1.0)).rgb);
+          s += luma(texture2D(u_tex, uv + off * vec2( 1.0, 1.0)).rgb);
+          s += luma(texture2D(u_tex, uv + off * vec2(-1.0, 1.0)).rgb);
+          s += luma(texture2D(u_tex, uv + off * vec2( 1.0,-1.0)).rgb);
+          s += luma(texture2D(u_tex, uv + off * vec2(-1.0,-1.0)).rgb);
+          return s / 8.0;
+        }
+
+        void main() {
+          // 1. Distortion
+          vec2 screenUV = barrel(v_uv, 0.06);
+
+          if (screenUV.x < 0.0 || screenUV.x > 1.0 || screenUV.y < 0.0 || screenUV.y > 1.0) {
+            gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+            return;
+          }
+
+          // 2. Vertical Hold Failure (Rolling)
+          // Brief burst: flicker, then a quick roll, then back to normal.
+          float burstPeriod = 8.0;
+          float flickerDur = 0.18;
+          float rollDur = 0.35;
+          float cycle = fract(u_time / burstPeriod);
+          float vOffset = 0.0;
+          
+          vec2 sourceUV = screenUV;
+          // WebGL textures usually 0,0 at bottom-left? No, top-left for images/video usually,
+          // but let's check. If image is upside down, we flip.
+          // Standard GL convention: 0,0 bottom left.
+          // Video element: usually top-down.
+          // Let's assume standard UVs.
+          // To scroll "up" (content moves up), we add to Y if 0 is bottom?
+          // If 0 is top, adding to Y moves down.
+          // Let's just add vOffset and see. It's a loop anyway.
+          if (cycle < flickerDur) {
+            vOffset = 0.0;
+          } else if (cycle < (flickerDur + rollDur)) {
+            float rollSpeed = 2.5;
+            vOffset = fract(u_time * rollSpeed);
+          }
+          sourceUV.y = fract(sourceUV.y + vOffset);
+
+          // 3. Sample
+          vec3 src = texture2D(u_tex, sourceUV).rgb;
+          float y = luma(src);
+
+          // Contrast/Brightness
+          float t = max(0.0, y - 0.05);
+          t = pow(t, 0.9);
+          t = t * 1.2;
+
+          // 4. Artifacts
+          // Scanlines
+          float scanCount = u_res.y * 0.5;
+          float scan = 0.85 + 0.15 * sin(screenUV.y * 3.14159 * scanCount * 2.0);
+          
+          // Flicker
+          float flickerBase = 0.98 + 0.02 * sin(u_time * 60.0 * 6.28);
+          float flickerBoost = 1.0;
+          if (cycle < flickerDur) {
+            flickerBoost = 0.9 + 0.1 * sin(u_time * 180.0 * 6.28);
+          } else if (cycle < (flickerDur + rollDur)) {
+            flickerBoost = 0.95 + 0.05 * sin(u_time * 120.0 * 6.28);
+          }
+          float flicker = flickerBase * flickerBoost;
+          
+          // Noise
+          float n = hash(screenUV * u_res + vec2(u_time * 10.0, u_time * 55.0));
+          float grain = (n - 0.5) * 0.08;
+          
+          // Bloom
+          vec2 px = 1.0 / u_res;
+          float b = blurLuma(sourceUV, px);
+          float bloom = max(0.0, b - 0.4) * 0.5;
+
+          // Vignette
+          vec2 p = screenUV * 2.0 - 1.0;
+          float aspect = u_res.x / u_res.y;
+          p.x *= aspect;
+          float r2 = dot(p, p);
+          float vig = smoothstep(1.3, 0.6, r2);
+
+          // 5. Combine
+          float intensity = t + bloom;
+          intensity = (intensity + grain) * scan * flicker * vig;
+          intensity = clamp(intensity, 0.0, 1.0);
+
+          // 6. Color (P1 Green)
+          vec3 pBlack = vec3(0.0, 0.02, 0.0);
+          vec3 pDim   = vec3(0.0, 0.25, 0.1);
+          vec3 pMid   = vec3(0.0, 0.75, 0.25);
+          vec3 pBright= vec3(0.6, 1.0, 0.6);
+
+          vec3 col = mix(pBlack, pDim, smoothstep(0.0, 0.3, intensity));
+          col = mix(col, pMid, smoothstep(0.3, 0.7, intensity));
+          col = mix(col, pBright, smoothstep(0.7, 1.0, intensity));
+          
+          col += pMid * bloom * 0.5;
+
+          gl_FragColor = vec4(col, 1.0);
+        }
+      `;
+
+      function compile(type, src) {
+        const s = gl.createShader(type);
+        gl.shaderSource(s, src);
+        gl.compileShader(s);
+        if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+          console.error(gl.getShaderInfoLog(s));
+          return null;
+        }
+        return s;
+      }
+
+      const prog = gl.createProgram();
+      gl.attachShader(prog, compile(gl.VERTEX_SHADER, vs));
+      gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fs));
+      gl.linkProgram(prog);
+      gl.useProgram(prog);
+
+      const buf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]), gl.STATIC_DRAW);
+
+      const a_pos = gl.getAttribLocation(prog, "a_pos");
+      gl.enableVertexAttribArray(a_pos);
+      gl.vertexAttribPointer(a_pos, 2, gl.FLOAT, false, 0, 0);
+
+      const u_tex = gl.getUniformLocation(prog, "u_tex");
+      const u_res = gl.getUniformLocation(prog, "u_res");
+      const u_time = gl.getUniformLocation(prog, "u_time");
+
+      const tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      // CLAMP_TO_EDGE is safer for NPOT video textures in WebGL 1.
+      // We handle wrapping manually in the shader using fract().
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+      const t0 = performance.now();
+      function loop() {
+        resize();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        // Important: Update texture from video
+        if (video.readyState >= video.HAVE_CURRENT_DATA) {
+             gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, video);
+        }
+
+        gl.uniform2f(u_res, canvas.width, canvas.height);
+        gl.uniform1f(u_time, (performance.now() - t0) / 1000.0);
+        
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+        requestAnimationFrame(loop);
+      }
+      loop();
+    })();
+  </script>
+</body>
+</html>
